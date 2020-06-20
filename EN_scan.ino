@@ -1,9 +1,10 @@
-/*
-   Based on Neil Kolban example for IDF: https://github.com/nkolban/esp32-snippets/blob/master/cpp_utils/tests/BLE%20Tests/SampleScan.cpp
-   Ported to Arduino ESP32 by Evandro Copercini
-*/
+#include <DNSServer.h>
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 1, 1);
+DNSServer dnsServer;
 
 #include <WiFi.h>
+#include <WiFiAP.h>
 
 const char* ssid     = "xxxx";
 const char* password = "xxxx";
@@ -24,10 +25,16 @@ BLEAddress* exposureDevice[255];
 #include <thread>
 
 std::thread *scan_loop_thread;
+std::thread *update_display_thread;
 
 #include <ESPAsyncWebServer.h>
 
 AsyncWebServer server(80);
+
+#include <U8g2lib.h>
+#include <Wire.h>
+
+U8G2_SSD1306_128X32_UNIVISION_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ 4, /* data=*/ 5, /* reset=*/ U8X8_PIN_NONE);   // Adafruit Feather M0 Basic Proto + FeatherWing OLED
 
 class MyENDevice{
   public:
@@ -46,7 +53,6 @@ std::list <MyENDevice> latestDevices;
 int intFoundDevices;
 
 int lastIntFoundDevices[100] {0};
-//MyENDevice testDevice();
 
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
@@ -59,6 +65,60 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
       }
     }
 };
+
+
+void update_display() {
+  while (true) {
+      u8g2.firstPage();
+      do {
+        drawAddress();
+        drawDiagram(lastIntFoundDevices, *std::max_element(std::begin(lastIntFoundDevices),std::end(lastIntFoundDevices)), sizeof(lastIntFoundDevices)/sizeof(int));
+      } while ( u8g2.nextPage() );
+  delay(2000);
+  }
+
+  }
+
+void drawAddress(void) {
+  char str[100];
+  String s;
+  u8g2.setFont(u8g2_font_open_iconic_embedded_1x_t);
+  if (WiFi.status() == WL_CONNECTED) {
+    u8g2.drawStr(0, 32, "\x50 \x4a");
+    }
+  else {
+    u8g2.drawStr(0, 32, "\x47 \x4a");
+  }
+  
+  u8g2.setFont(u8g2_font_profont10_tf);
+  if (latestDevices.size() == 0) {
+      latestDevices.push_front(MyENDevice("--:--:--:--:--:--"));
+  }
+  //std::rotate(latestDevices.begin(), std::next(latestDevices.begin()), latestDevices.end());
+  latestDevices.splice( latestDevices.end(), latestDevices, latestDevices.begin() );
+  sprintf(str, "%s", latestDevices.front().address.c_str());
+  s = String(str);
+  u8g2.drawStr(16, 31, str);
+  u8g2.drawStr(102, 6, "# OF");
+  u8g2.drawStr(102, 14, "EXPNO");
+  u8g2.setFont(u8g2_font_profont22_tn);
+  sprintf(str, "%*d",2, latestDevices.size());
+  s = str;
+  u8g2.drawStr(102, 32, str);
+
+}
+
+void drawDiagram(int points[], int maxValue, int size) {
+  if (maxValue < 1) maxValue = 1;
+  char str[100];
+  sprintf(str, "%d", maxValue);
+  String s = str;
+  u8g2.setFont(u8g2_font_profont10_tf);
+  u8g2.drawStr(1, 6, str);
+  for(int i = 0; i<size-1;i++){
+    u8g2.drawLine(i, 22-(points[i]*22./(1.1*maxValue)),i+1, 22-(points[i+1]*22./(1.1*maxValue)));
+  }
+}
 
 void scan_loop() {
   while(true) {
@@ -88,22 +148,6 @@ void notFound(AsyncWebServerRequest *request) {
 }
 
 void handleRoot(AsyncWebServerRequest *request) {
-  /*char temp[400];
-  snprintf(temp, 400, 
-  "<html>\
-   <head>\
-     <meta http-equiv='refresh' content='5'/>\
-     <title>Exposure Notification Scanner</title>\
-     <style>\
-      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
-     </style>\
-   </head>\
-   <body>\
-     <h1>Exposure Notification Scanner</h1>\
-     <p>Exposure Notifications Found: %02d</p>\
-   </body>\
-   </html>", intFoundDevices
-  );*/
   char temp[2048]; 
   snprintf(temp, sizeof(temp), 
   "<html>\
@@ -157,21 +201,27 @@ void handleRoot(AsyncWebServerRequest *request) {
   ");
   request->send(200, "text/html", temp);
 }
-int LED_BUILTIN = 1;
+
+
 void setup() {
-  
-  
+   
   Serial.begin(115200);
 
+  u8g2.begin();
+  u8g2.setFlipMode(0);
+  u8g2.setFont(u8g2_font_profont10_tf);
+
   Serial.println("ESP32 started");
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
+
   server.on("/", handleRoot);
   server.onNotFound(notFound);
 
   int c = 0;
   Serial.print("Connecting to ");
+  u8g2.drawStr(0, 8, "Connecting to Wifi");
   Serial.println(ssid);
+  u8g2.sendBuffer();
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED && c <=20) {
     delay(500);
@@ -185,12 +235,19 @@ void setup() {
     Serial.println(WiFi.localIP());
     server.begin();
     Serial.println("HTTP server started");
-    digitalWrite(LED_BUILTIN,LOW);
   }
   else {
-    // TODO: Start AP Mode with captive Portal
-    Serial.println("No Wifi Connection");
-    
+    //WiFi.disconnect();
+    Serial.println("Can't connect to Wifi. Starting Access Point");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    WiFi.softAP("Exposure Notification Scanner");
+
+    // if DNSServer is started with "*" for domain name, it will reply with
+    // provided IP to all DNS request
+    dnsServer.start(DNS_PORT, "*", apIP);
+    server.begin();
+    Serial.println("HTTP server started");
   }
 
   
@@ -206,8 +263,12 @@ void setup() {
 
   Serial.println("Starting scan loop");
   scan_loop_thread =new std::thread(scan_loop);
+  update_display_thread = new std::thread(update_display);
 }
 
 void loop() {
+  if (WiFi.getMode() == WIFI_AP) {
+    dnsServer.processNextRequest();
+    }
 
 }
